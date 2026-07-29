@@ -1,0 +1,25 @@
+# Secrets
+api.txt
+*.key
+.env
+.env.*
+!.env.example
+
+# Runtime files
+*.log
+.agentrouter-proxy.pid
+__pycache__/
+*.py[cod]
+
+# Virtual environments and tools
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

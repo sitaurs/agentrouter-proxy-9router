@@ -1,0 +1,63 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.11"
+          - "3.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile Python sources
+        run: >-
+          python -m py_compile
+          agentrouter-proxy.py
+          check-setup.py
+          tests/test_proxy.py
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Parse PowerShell scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = @()
+          $tokens = @()
+          Get-ChildItem -Filter '*.ps1' | ForEach-Object {
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            )
+          }
+          if ($errors.Count -gt 0) {
+            $errors | Format-List
+            exit 1
+          }
+
+      - name: Parse shell scripts
+        if: runner.os == 'Linux'
+        run: bash -n install.sh start-agentrouter-proxy.sh stop-agentrouter-proxy.sh
