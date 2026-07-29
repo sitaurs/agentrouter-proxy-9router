@@ -22,10 +22,6 @@ if ([string]::IsNullOrWhiteSpace($KeyFile)) {
     $KeyFile = Join-Path $proxyDir "api.txt"
 }
 
-if (-not $env:AGENTROUTER_API_KEY -and -not (Test-Path -LiteralPath $KeyFile)) {
-    throw "API key not found. Copy api.example.txt to api.txt, then paste your AgentRouter API key."
-}
-
 $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 if ($listeners) {
     $ownerPid = ($listeners | Select-Object -First 1).OwningProcess

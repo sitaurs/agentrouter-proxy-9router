@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Local AgentRouter compatibility proxy for 9Router.
 
-The proxy keeps the AgentRouter API key outside 9Router, adapts OpenAI-style
-requests for AgentRouter, relays SSE without buffering, and normalizes usage
-metadata so 9Router can record token counts correctly.
+The proxy accepts the AgentRouter API key from 9Router's Authorization header,
+adapts OpenAI-style requests for AgentRouter, relays SSE without buffering,
+and normalizes usage metadata so 9Router can record token counts correctly.
 """
 
 from __future__ import annotations
@@ -30,6 +30,14 @@ MAX_UPSTREAM_ATTEMPTS = 3
 UPSTREAM_HEADER_TIMEOUT_SECONDS = 20
 UPSTREAM_STREAM_TIMEOUT_SECONDS = 180
 RETRYABLE_UPSTREAM_STATUSES = {502, 503, 504}
+PLACEHOLDER_API_KEYS = {
+    "",
+    "local-proxy",
+    "placeholder",
+    "change-me",
+    "your_agentrouter_api_key",
+    "paste-your-agentrouter-api-key-here",
+}
 
 # AgentRouter's compatibility endpoint expects these client-identification
 # headers. They are static metadata and never contain the user's API key.
@@ -151,21 +159,137 @@ def normalize_sse_event(event: bytes) -> bytes | None:
     return b"\n".join(normalized_lines)
 
 
-def load_api_key(path: Path) -> str:
-    """Load an AgentRouter key from the environment or a local ignored file."""
+def extract_sse_error(event: bytes) -> tuple[int, dict[str, Any]] | None:
+    """Convert an OpenAI-style SSE error event into an HTTP error response."""
+    for line in event.splitlines():
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == b"[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or "error" not in payload:
+            continue
+
+        error = payload["error"]
+        if isinstance(error, str):
+            try:
+                nested = json.loads(error)
+                if isinstance(nested, dict) and "error" in nested:
+                    error = nested["error"]
+            except json.JSONDecodeError:
+                pass
+
+        if isinstance(error, dict):
+            message = str(error.get("message") or "AgentRouter stream failed")
+            error_type = str(error.get("type") or "upstream_stream_error")
+            code = error.get("code")
+            status_values = (
+                error.get("status"),
+                error.get("status_code"),
+                error.get("statusCode"),
+                payload.get("status"),
+            )
+        else:
+            message = str(error or "AgentRouter stream failed")
+            error_type = "upstream_stream_error"
+            code = None
+            status_values = (payload.get("status"),)
+
+        status = next(
+            (
+                value
+                for value in status_values
+                if isinstance(value, int) and 400 <= value <= 599
+            ),
+            None,
+        )
+        lowered = f"{message} {code or ''}".lower()
+        if "sensitive word" in lowered:
+            status = 400
+        elif "unauthorized" in lowered or "invalid api key" in lowered:
+            status = 401
+        elif "rate limit" in lowered:
+            status = 429
+        elif "overload" in lowered or "all nodes exhausted" in lowered:
+            status = 503
+        elif status is None:
+            status = 502
+
+        return status, {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": error.get("param") if isinstance(error, dict) else None,
+                "code": code,
+            }
+        }
+    return None
+
+
+def read_sse_event(response: http.client.HTTPResponse) -> bytes | None:
+    """Read one complete SSE event, returning None at a clean EOF."""
+    event_lines: list[bytes] = []
+    while line := response.readline():
+        normalized = line.rstrip(b"\r\n")
+        if normalized:
+            event_lines.append(normalized)
+        elif event_lines:
+            return b"\n".join(event_lines)
+    return b"\n".join(event_lines) if event_lines else None
+
+
+def is_sse_done(event: bytes) -> bool:
+    """Return True when an event contains the OpenAI stream terminator."""
+    return any(
+        line.startswith(b"data:") and line[5:].strip() == b"[DONE]"
+        for line in event.splitlines()
+    )
+
+
+def bearer_token(authorization: str | None) -> str | None:
+    """Return a non-placeholder Bearer token from an inbound header."""
+    if not authorization:
+        return None
+    scheme, separator, token = authorization.strip().partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return None
+    cleaned = token.strip().strip("\"'")
+    if cleaned.lower() in PLACEHOLDER_API_KEYS:
+        return None
+    return cleaned or None
+
+
+def select_upstream_api_key(
+    authorization: str | None, default_api_key: str | None
+) -> str:
+    """Prefer the API key stored in 9Router, then use the optional fallback."""
+    inbound_key = bearer_token(authorization)
+    if inbound_key:
+        return inbound_key
+    if default_api_key:
+        return default_api_key
+    raise PermissionError(
+        "AgentRouter API key is missing. Enter it in 9Router's API Key field "
+        "or configure api.txt / AGENTROUTER_API_KEY as a fallback."
+    )
+
+
+def load_default_api_key(path: Path) -> str | None:
+    """Load an optional fallback key from the environment or ignored file."""
     environment_key = os.getenv("AGENTROUTER_API_KEY", "").strip().strip("\"'")
     if environment_key:
         return environment_key
 
     if not path.is_file():
-        raise FileNotFoundError(
-            f"AgentRouter API key not found. Create {path} or set "
-            "AGENTROUTER_API_KEY."
-        )
+        return None
 
     key = path.read_text(encoding="utf-8").strip().strip("\"'")
-    if not key or key == "paste-your-agentrouter-api-key-here":
-        raise ValueError(f"AgentRouter API key is empty or still a placeholder: {path}")
+    if key.lower() in PLACEHOLDER_API_KEYS:
+        return None
     return key
 
 
@@ -187,7 +311,7 @@ class ProxyServer(ThreadingHTTPServer):
         handler_class: type[BaseHTTPRequestHandler],
         *,
         upstream: str,
-        api_key: str,
+        api_key: str | None,
     ) -> None:
         super().__init__(server_address, handler_class)
         parsed = urlsplit(upstream)
@@ -258,9 +382,23 @@ class AgentRouterProxyHandler(BaseHTTPRequestHandler):
         cleaned = adapt_9router_health_probe(cleaned)
         return json.dumps(cleaned, separators=(",", ":")).encode("utf-8")
 
-    def _upstream_headers(self, body: bytes | None) -> dict[str, str]:
+    def _send_json_response(self, status: int, value: dict[str, Any]) -> None:
+        payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        self.wfile.write(payload)
+        self.wfile.flush()
+
+    def _upstream_headers(
+        self, body: bytes | None, api_key: str
+    ) -> dict[str, str]:
         headers = {
-            "Authorization": f"Bearer {self.server.api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": self.headers.get("Content-Type", "application/json"),
             "Accept": self.headers.get("Accept", "application/json"),
             **CLIENT_HEADERS,
@@ -269,15 +407,64 @@ class AgentRouterProxyHandler(BaseHTTPRequestHandler):
             headers["Content-Length"] = str(len(body))
         return headers
 
+    def _preflight_sse(
+        self, response: http.client.HTTPResponse
+    ) -> tuple[bytes | None, tuple[int, dict[str, Any]] | None]:
+        """Read through ignorable events and reject an error before HTTP 200."""
+        while event := read_sse_event(response):
+            error = extract_sse_error(event)
+            if error is not None:
+                return None, error
+            if normalize_sse_event(event) is None:
+                continue
+            if is_sse_done(event):
+                break
+            return event, None
+        return None, (
+            502,
+            {
+                "error": {
+                    "message": "AgentRouter stream ended before the first event",
+                    "type": "upstream_stream_error",
+                    "param": None,
+                    "code": "empty_stream",
+                }
+            },
+        )
+
     def _proxy_request(self) -> None:
         body = self._request_body()
         upstream_path = f"{self.server.upstream_prefix}{self.path}"
         connection: http.client.HTTPSConnection | None = None
         response: http.client.HTTPResponse | None = None
         headers_sent = False
+        is_stream = False
+        first_sse_event: bytes | None = None
+        sse_error: tuple[int, dict[str, Any]] | None = None
 
         try:
+            try:
+                api_key = select_upstream_api_key(
+                    self.headers.get("Authorization"), self.server.api_key
+                )
+            except PermissionError as exc:
+                self._send_json_response(
+                    401,
+                    {
+                        "error": {
+                            "message": str(exc),
+                            "type": "authentication_error",
+                            "param": None,
+                            "code": "missing_agentrouter_api_key",
+                        }
+                    },
+                )
+                return
+
             for attempt in range(1, MAX_UPSTREAM_ATTEMPTS + 1):
+                first_sse_event = None
+                sse_error = None
+                is_stream = False
                 connection = http.client.HTTPSConnection(
                     self.server.upstream_host,
                     self.server.upstream_port,
@@ -289,7 +476,7 @@ class AgentRouterProxyHandler(BaseHTTPRequestHandler):
                         self.command,
                         upstream_path,
                         body=body,
-                        headers=self._upstream_headers(body),
+                        headers=self._upstream_headers(body, api_key),
                     )
                     response = connection.getresponse()
                 except (TimeoutError, socket.timeout, ConnectionError) as exc:
@@ -321,15 +508,43 @@ class AgentRouterProxyHandler(BaseHTTPRequestHandler):
                     response = None
                     time.sleep(0.25 * attempt)
                     continue
+
+                content_type = response.getheader("Content-Type", "")
+                is_stream = "text/event-stream" in content_type.lower()
+                if is_stream and 200 <= response.status < 300:
+                    if connection.sock is not None:
+                        connection.sock.settimeout(UPSTREAM_STREAM_TIMEOUT_SECONDS)
+                    first_sse_event, sse_error = self._preflight_sse(response)
+                    if (
+                        sse_error is not None
+                        and sse_error[0] in RETRYABLE_UPSTREAM_STATUSES
+                        and attempt < MAX_UPSTREAM_ATTEMPTS
+                    ):
+                        logging.warning(
+                            "[ar] upstream SSE attempt %s/%s returned error %s; "
+                            "retrying",
+                            attempt,
+                            MAX_UPSTREAM_ATTEMPTS,
+                            sse_error[0],
+                        )
+                        connection.close()
+                        connection = None
+                        response = None
+                        time.sleep(0.25 * attempt)
+                        continue
                 break
 
             if connection is None or response is None:
                 raise RuntimeError("AgentRouter did not return a response")
+            if sse_error is not None:
+                self._send_json_response(*sse_error)
+                logging.warning(
+                    "[ar] converted HTTP 200 SSE error into HTTP %s",
+                    sse_error[0],
+                )
+                return
             if connection.sock is not None:
                 connection.sock.settimeout(UPSTREAM_STREAM_TIMEOUT_SECONDS)
-
-            content_type = response.getheader("Content-Type", "")
-            is_stream = "text/event-stream" in content_type.lower()
 
             self.send_response(response.status, response.reason)
             for name, value in response.getheaders():
@@ -344,7 +559,7 @@ class AgentRouterProxyHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
             if is_stream:
-                self._relay_sse(response)
+                self._relay_sse(response, first_sse_event)
             else:
                 payload = response.read()
                 try:
@@ -363,44 +578,48 @@ class AgentRouterProxyHandler(BaseHTTPRequestHandler):
             logging.exception("[ar] proxy error: %s", exc)
             if not headers_sent and not self.wfile.closed:
                 try:
-                    payload = json.dumps(
-                        {"error": {"message": f"AgentRouter proxy error: {exc}"}}
-                    ).encode("utf-8")
-                    self.send_response(502)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(payload)))
-                    self.end_headers()
-                    self.wfile.write(payload)
+                    self._send_json_response(
+                        502,
+                        {
+                            "error": {
+                                "message": f"AgentRouter proxy error: {exc}",
+                                "type": "proxy_error",
+                                "param": None,
+                                "code": "agentrouter_proxy_error",
+                            }
+                        },
+                    )
                 except Exception:
                     pass
         finally:
             if connection is not None:
                 connection.close()
 
-    def _relay_sse(self, response: http.client.HTTPResponse) -> None:
-        event_lines: list[bytes] = []
-
-        def relay_event() -> None:
-            if not event_lines:
-                return
-            event = b"\n".join(event_lines)
-            event_lines.clear()
+    def _relay_sse(
+        self, response: http.client.HTTPResponse, first_event: bytes | None
+    ) -> None:
+        def relay_event(event: bytes) -> bool:
+            error = extract_sse_error(event)
+            if error is not None:
+                # Headers have already been sent. Closing before [DONE] makes
+                # 9Router treat this as an interrupted stream instead of a
+                # successful 0/0 completion.
+                logging.warning(
+                    "[ar] closing stream after late SSE error %s", error[0]
+                )
+                return False
             normalized = normalize_sse_event(event)
             if normalized is None:
-                return
+                return True
             self.wfile.write(normalized + b"\n\n")
             self.wfile.flush()
+            return True
 
-        # SSE is line-delimited. A large fixed-size read can hold small events
-        # until a buffer fills, making a healthy stream appear frozen.
-        while line := response.readline():
-            normalized = line.rstrip(b"\r\n")
-            if normalized:
-                event_lines.append(normalized)
-            else:
-                relay_event()
-
-        relay_event()
+        if first_event is not None and not relay_event(first_event):
+            return
+        while event := read_sse_event(response):
+            if not relay_event(event):
+                return
 
 
 def parse_args() -> argparse.Namespace:
@@ -419,7 +638,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    api_key = load_api_key(args.key_file)
+    api_key = load_default_api_key(args.key_file)
     server = ProxyServer(
         (args.host, args.port),
         AgentRouterProxyHandler,

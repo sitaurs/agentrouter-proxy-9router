@@ -21,11 +21,6 @@ if [ -f "$pid_file" ]; then
     rm -f "$pid_file"
 fi
 
-if [ -z "${AGENTROUTER_API_KEY:-}" ] && [ ! -f "$root_dir/api.txt" ]; then
-    echo "API key not found. Run ./install.sh first." >&2
-    exit 1
-fi
-
 nohup "$python_cmd" "$root_dir/agentrouter-proxy.py" \
     --host 127.0.0.1 \
     --port 4182 \

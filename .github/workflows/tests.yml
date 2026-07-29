@@ -60,4 +60,9 @@ jobs:
 
       - name: Parse shell scripts
         if: runner.os == 'Linux'
-        run: bash -n install.sh start-agentrouter-proxy.sh stop-agentrouter-proxy.sh
+        run: >-
+          bash -n
+          install.sh
+          install-systemd.sh
+          start-agentrouter-proxy.sh
+          stop-agentrouter-proxy.sh

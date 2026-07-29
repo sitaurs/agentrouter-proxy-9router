@@ -11,18 +11,7 @@ function Write-Step([string]$Message) {
     Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
-function Get-PlainText([Security.SecureString]$SecureValue) {
-    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureValue)
-    try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
-    } finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
-    }
-}
-
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$keyFile = Join-Path $root "api.txt"
-$exampleKey = "paste-your-agentrouter-api-key-here"
 $startupDir = [Environment]::GetFolderPath("Startup")
 $shortcutPath = Join-Path $startupDir "AgentRouter Proxy for 9Router.lnk"
 
@@ -42,32 +31,6 @@ if ($pythonVersion -lt [Version]"3.11") {
     throw "Python 3.11 or newer is required. Found: $pythonVersionText"
 }
 Write-Host "Python $pythonVersionText found."
-
-Write-Step "Configuring the AgentRouter API key"
-$needsKey = $true
-if (Test-Path -LiteralPath $keyFile) {
-    $existingKey = (Get-Content -Raw -LiteralPath $keyFile).Trim()
-    if ($existingKey -and $existingKey -ne $exampleKey) {
-        $needsKey = $false
-        Write-Host "Existing api.txt found; keeping it."
-    }
-}
-
-if ($needsKey) {
-    $secureKey = Read-Host "Paste your AgentRouter API key" -AsSecureString
-    $plainKey = Get-PlainText $secureKey
-    try {
-        if ([string]::IsNullOrWhiteSpace($plainKey)) {
-            throw "The API key cannot be empty."
-        }
-        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-        [IO.File]::WriteAllText($keyFile, $plainKey.Trim(), $utf8NoBom)
-    } finally {
-        $plainKey = $null
-        $secureKey.Dispose()
-    }
-    Write-Host "API key saved to ignored local file api.txt."
-}
 
 if (-not $SkipTests) {
     Write-Step "Running offline tests"
@@ -104,8 +67,9 @@ Name:      AgentRouter Local
 Prefix:    ar
 API Type:  Chat Completions
 Base URL:  http://127.0.0.1:4182/v1
-API Key:   local-proxy
+API Key:   YOUR_AGENTROUTER_API_KEY
 Test model: claude-opus-5
 "@
 
+Write-Host "Store the real AgentRouter API key in 9Router's API Key field."
 Write-Host "Installation is complete." -ForegroundColor Green

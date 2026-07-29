@@ -2,8 +2,18 @@
 set -eu
 
 root_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-key_file="$root_dir/api.txt"
-example_key="paste-your-agentrouter-api-key-here"
+
+if [ "${1:-}" = "--background" ]; then
+    shift
+elif command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    exec "$root_dir/install-systemd.sh" "$@"
+fi
+
+if [ "$#" -gt 0 ]; then
+    echo "Unknown option: $1" >&2
+    echo "Use --background to bypass automatic systemd installation." >&2
+    exit 2
+fi
 
 if command -v python3 >/dev/null 2>&1; then
     python_cmd=python3
@@ -21,39 +31,11 @@ if sys.version_info < (3, 11):
 print(f"Python {sys.version.split()[0]} found")
 '
 
-needs_key=1
-if [ -n "${AGENTROUTER_API_KEY:-}" ]; then
-    needs_key=0
-    echo "Using AGENTROUTER_API_KEY from the environment."
-elif [ -f "$key_file" ]; then
-    current_key=$(tr -d '\r\n' < "$key_file")
-    if [ -n "$current_key" ] && [ "$current_key" != "$example_key" ]; then
-        needs_key=0
-        echo "Existing api.txt found; keeping it."
-    fi
-fi
-
-if [ "$needs_key" -eq 1 ]; then
-    printf "Paste your AgentRouter API key: "
-    trap 'stty echo 2>/dev/null || true' EXIT INT TERM
-    stty -echo
-    IFS= read -r api_key
-    stty echo
-    trap - EXIT INT TERM
-    printf "\n"
-    if [ -z "$api_key" ]; then
-        echo "The API key cannot be empty." >&2
-        exit 1
-    fi
-    umask 077
-    printf "%s" "$api_key" > "$key_file"
-    unset api_key
-    chmod 600 "$key_file"
-    echo "API key saved to ignored local file api.txt."
-fi
-
 "$python_cmd" -m unittest discover -s "$root_dir/tests" -v
-chmod +x "$root_dir/start-agentrouter-proxy.sh" "$root_dir/stop-agentrouter-proxy.sh"
+chmod +x \
+    "$root_dir/start-agentrouter-proxy.sh" \
+    "$root_dir/stop-agentrouter-proxy.sh" \
+    "$root_dir/install-systemd.sh"
 "$root_dir/start-agentrouter-proxy.sh"
 "$python_cmd" "$root_dir/check-setup.py"
 
@@ -64,8 +46,9 @@ cat <<'EOF'
   Prefix:     ar
   API Type:   Chat Completions
   Base URL:   http://127.0.0.1:4182/v1
-  API Key:    local-proxy
+  API Key:    YOUR_AGENTROUTER_API_KEY
   Test model: claude-opus-5
 
+Store the real AgentRouter API key in 9Router's API Key field.
 Installation is complete.
 EOF

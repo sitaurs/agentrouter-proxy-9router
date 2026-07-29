@@ -2,9 +2,13 @@
 
 ## Menyimpan API key
 
+- Cara yang direkomendasikan: simpan key pada field API Key connection 9Router.
+- Proxy meneruskan Bearer token tersebut per request dan tidak menuliskannya ke
+  log atau file.
 - Jangan commit `api.txt`, `.env`, log, atau screenshot yang menampilkan key.
 - `api.txt` sudah tercantum di `.gitignore`.
-- Alternatifnya, gunakan environment variable `AGENTROUTER_API_KEY`.
+- `api.txt` dan `AGENTROUTER_API_KEY` hanya fallback opsional untuk klien yang
+  tidak dapat mengirim header Authorization.
 - Jika key pernah masuk commit atau log publik, segera revoke dan buat key baru.
 
 ## Membatasi akses proxy
@@ -15,7 +19,9 @@ dapat menggunakannya.
 
 Jangan menjalankan proxy dengan `--host 0.0.0.0` pada komputer yang dapat
 diakses publik tanpa firewall atau reverse proxy berautentikasi. Siapa pun yang
-dapat menjangkau port proxy dapat memakai API key AgentRouter yang disimpan.
+dapat menjangkau port proxy dapat mengirim request ke AgentRouter. Jika fallback
+key dikonfigurasi, mereka juga dapat memakai fallback tersebut tanpa mengetahui
+nilainya.
 
 ## Melaporkan kerentanan
 
